@@ -1,0 +1,159 @@
+name: BREIT BRUT 5 AI - Android APK
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: breit-brut-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Extract source, test and build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # Deliberately use one exact archive name. This prevents an old ZIP
+      # in the repository from silently being selected instead of the fix.
+      - name: Extract the V2 Android project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/BREIT_BRUT_5_AI_APK_FIX_V2.zip"
+          if [[ ! -s "$archive" ]]; then
+            echo "ERROR: Required source archive is missing: BREIT_BRUT_5_AI_APK_FIX_V2.zip" >&2
+            echo "Upload the matching V2 ZIP to the repository root and remove old source ZIPs." >&2
+            ls -la "$GITHUB_WORKSPACE" >&2
+            exit 1
+          fi
+
+          work="$RUNNER_TEMP/breit-brut-v2-source"
+          rm -rf "$work"
+          mkdir -p "$work"
+          unzip -q "$archive" -d "$work"
+          settings_file="$(find "$work" -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
+          if [[ -z "$settings_file" ]]; then
+            echo "ERROR: ZIP does not contain settings.gradle(.kts)." >&2
+            exit 1
+          fi
+          project_root="$(dirname "$settings_file")"
+          if [[ ! -f "$project_root/app/build.gradle.kts" && ! -f "$project_root/app/build.gradle" ]]; then
+            echo "ERROR: ZIP does not contain app/build.gradle(.kts) beside settings.gradle." >&2
+            exit 1
+          fi
+
+          # Remove stale extracted project files but preserve the Git checkout.
+          for item in app gradle build.gradle.kts build.gradle settings.gradle.kts settings.gradle gradle.properties gradlew gradlew.bat; do
+            rm -rf "$GITHUB_WORKSPACE/$item"
+          done
+          cp -a "$project_root"/. "$GITHUB_WORKSPACE"/
+          chmod +x "$GITHUB_WORKSPACE/gradlew" 2>/dev/null || true
+
+          echo "Selected source archive: BREIT_BRUT_5_AI_APK_FIX_V2.zip"
+          echo "Resolved Compose BOM and Android build settings:"
+          grep -nE 'compose-bom|compileSdk|targetSdk|kotlinOptions|compilerOptions' "$GITHUB_WORKSPACE/app/build.gradle.kts" || true
+          echo "Gradle project files:"
+          find "$GITHUB_WORKSPACE" -maxdepth 4 -type f \( -name '*.gradle' -o -name '*.gradle.kts' -o -name 'gradle-wrapper.properties' \) -print
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android API 36 packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Set up Gradle 8.14.4
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.14.4'
+          cache-provider: basic
+          validate-wrappers: false
+
+      - name: Verify project and dependency configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f settings.gradle.kts
+          test -f build.gradle.kts
+          test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
+          grep -q 'compose-bom:2026.04.01' app/build.gradle.kts
+          echo "Project files found; Compose BOM is pinned to 2026.04.01 for the API 36 / AGP 8.13 toolchain."
+
+      - name: Run unit tests
+        id: unit_tests
+        continue-on-error: true
+        run: gradle testDebugUnitTest --no-daemon --stacktrace --info
+
+      - name: Build debug APK
+        id: build_apk
+        run: gradle assembleDebug --no-daemon --stacktrace --info
+
+      - name: Prepare and verify APK
+        id: prepare_apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          mkdir -p dist
+          cp "$APK" "dist/BREIT_BRUT_5_AI-debug.apk"
+          sha256sum "dist/BREIT_BRUT_5_AI-debug.apk"
+          ls -lh "dist/BREIT_BRUT_5_AI-debug.apk"
+
+      - name: Upload debug APK
+        if: always() && steps.prepare_apk.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BREIT_BRUT_5_AI-debug-APK
+          path: dist/BREIT_BRUT_5_AI-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: breit-brut-android-test-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## BREIT BRUT 5 AI - Android APK build"
+            echo "- Unit tests: `${{ steps.unit_tests.outcome }}`"
+            echo "- APK build: `${{ steps.build_apk.outcome }}`"
+            if [ -s "dist/BREIT_BRUT_5_AI-debug.apk" ]; then
+              echo "- APK file: `BREIT_BRUT_5_AI-debug.apk` (artifact uploaded)"
+            else
+              echo "- APK file: not generated"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail workflow if unit tests failed
+        if: steps.unit_tests.outcome == 'failure'
+        run: |
+          echo "Unit tests failed. Review the Gradle log and test reports above."
+          exit 1
