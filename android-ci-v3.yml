@@ -1,0 +1,166 @@
+name: BREIT BRUT 5 AI - Android APK V3
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: breit-brut-android-v3-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Diagnose dependencies, test and build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Extract exact V3 source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/BREIT_BRUT_5_AI_APK_FIX_V3.zip"
+          if [[ ! -s "$archive" ]]; then
+            echo "ERROR: Missing BREIT_BRUT_5_AI_APK_FIX_V3.zip in repository root." >&2
+            echo "Upload this exact file and remove old source ZIPs to avoid building stale code." >&2
+            ls -la "$GITHUB_WORKSPACE" >&2
+            exit 1
+          fi
+          work="$RUNNER_TEMP/breit-v3-source"
+          rm -rf "$work" && mkdir -p "$work"
+          unzip -q "$archive" -d "$work"
+          settings_file="$(find "$work" -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print -quit)"
+          [[ -n "$settings_file" ]] || { echo "No settings.gradle(.kts) found in V3 ZIP" >&2; exit 1; }
+          project_root="$(dirname "$settings_file")"
+          [[ -f "$project_root/app/build.gradle.kts" || -f "$project_root/app/build.gradle" ]] || { echo "No app module build file found beside settings file" >&2; exit 1; }
+          python3 - "$project_root" "$GITHUB_WORKSPACE" <<'PY'
+          from pathlib import Path
+          import shutil, sys
+          source, destination = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
+          ignored = {'.github', '.git', '__MACOSX'}
+          for item in source.iterdir():
+              if item.name in ignored:
+                  continue
+              target = destination / item.name
+              if item.is_dir():
+                  shutil.copytree(item, target, dirs_exist_ok=True)
+              else:
+                  shutil.copy2(item, target)
+          PY
+          chmod +x ./gradlew
+          echo '--- selected archive ---'
+          sha256sum "$archive"
+          echo '--- build configuration ---'
+          grep -nE 'com.android.application|org.jetbrains.kotlin|compose-bom|compileSdk|targetSdk|compilerOptions|jvmTarget' build.gradle.kts app/build.gradle.kts
+          echo '--- project files ---'
+          test -f settings.gradle.kts
+          test -f build.gradle.kts
+          test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
+          test -f gradle/wrapper/gradle-wrapper.properties
+          cat gradle/wrapper/gradle-wrapper.properties
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android API 36 packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Set up Gradle 8.14.4
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.14.4'
+          cache-provider: basic
+          validate-wrappers: false
+
+      - name: Print Gradle and Java versions
+        run: |
+          java -version
+          gradle --version
+
+      - name: Diagnose Android AAR metadata (full details)
+        id: aar_metadata
+        continue-on-error: true
+        run: gradle :app:checkDebugAarMetadata --no-daemon --stacktrace --info
+
+      - name: Run unit tests
+        id: unit_tests
+        continue-on-error: true
+        run: gradle testDebugUnitTest --no-daemon --stacktrace --info
+
+      - name: Build debug APK
+        id: build_apk
+        continue-on-error: true
+        run: gradle assembleDebug --no-daemon --stacktrace --info
+
+      - name: Verify and rename APK
+        id: prepare_apk
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='app/build/outputs/apk/debug/app-debug.apk'
+          if [[ ! -s "$apk" ]]; then
+            echo 'APK was not produced. See the AAR metadata, test and build logs above.' >&2
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$apk" dist/BREIT_BRUT_5_AI-debug.apk
+          sha256sum dist/BREIT_BRUT_5_AI-debug.apk
+          ls -lh dist/BREIT_BRUT_5_AI-debug.apk
+
+      - name: Upload debug APK
+        if: always() && steps.prepare_apk.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BREIT_BRUT_5_AI-debug-APK
+          path: dist/BREIT_BRUT_5_AI-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build and test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BREIT_BRUT_5_AI-build-diagnostics
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+            app/build/reports/problems/problems-report.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Summarize build status
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## BREIT BRUT 5 AI V3 build summary'
+            echo '- AAR metadata check: `${{ steps.aar_metadata.outcome }}`'
+            echo '- Unit tests: `${{ steps.unit_tests.outcome }}`'
+            echo '- APK build: `${{ steps.build_apk.outcome }}`'
+            if [[ -s dist/BREIT_BRUT_5_AI-debug.apk ]]; then
+              echo '- APK: generated and uploaded as artifact'
+            else
+              echo '- APK: not generated; inspect the detailed Gradle logs'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if APK build or tests failed
+        if: steps.build_apk.outcome != 'success' || steps.unit_tests.outcome != 'success'
+        run: |
+          echo 'Build and/or tests failed. Diagnostic reports are uploaded when available.'
+          exit 1
