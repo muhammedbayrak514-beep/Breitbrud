@@ -23,15 +23,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: gradle
-
-      # Deliberately use one exact archive name. This prevents an old ZIP
-      # in the repository from silently being selected instead of the fix.
       - name: Extract the V2 Android project ZIP
         shell: bash
         run: |
@@ -39,7 +30,6 @@ jobs:
           archive="$GITHUB_WORKSPACE/BREIT_BRUT_5_AI_APK_FIX_V2.zip"
           if [[ ! -s "$archive" ]]; then
             echo "ERROR: Required source archive is missing: BREIT_BRUT_5_AI_APK_FIX_V2.zip" >&2
-            echo "Upload the matching V2 ZIP to the repository root and remove old source ZIPs." >&2
             ls -la "$GITHUB_WORKSPACE" >&2
             exit 1
           fi
@@ -48,29 +38,36 @@ jobs:
           rm -rf "$work"
           mkdir -p "$work"
           unzip -q "$archive" -d "$work"
+
           settings_file="$(find "$work" -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
           if [[ -z "$settings_file" ]]; then
             echo "ERROR: ZIP does not contain settings.gradle(.kts)." >&2
             exit 1
           fi
+
           project_root="$(dirname "$settings_file")"
           if [[ ! -f "$project_root/app/build.gradle.kts" && ! -f "$project_root/app/build.gradle" ]]; then
             echo "ERROR: ZIP does not contain app/build.gradle(.kts) beside settings.gradle." >&2
             exit 1
           fi
 
-          # Remove stale extracted project files but preserve the Git checkout.
           for item in app gradle build.gradle.kts build.gradle settings.gradle.kts settings.gradle gradle.properties gradlew gradlew.bat; do
             rm -rf "$GITHUB_WORKSPACE/$item"
           done
+
           cp -a "$project_root"/. "$GITHUB_WORKSPACE"/
           chmod +x "$GITHUB_WORKSPACE/gradlew" 2>/dev/null || true
 
           echo "Selected source archive: BREIT_BRUT_5_AI_APK_FIX_V2.zip"
-          echo "Resolved Compose BOM and Android build settings:"
-          grep -nE 'compose-bom|compileSdk|targetSdk|kotlinOptions|compilerOptions' "$GITHUB_WORKSPACE/app/build.gradle.kts" || true
           echo "Gradle project files:"
           find "$GITHUB_WORKSPACE" -maxdepth 4 -type f \( -name '*.gradle' -o -name '*.gradle.kts' -o -name 'gradle-wrapper.properties' \) -print
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -94,7 +91,7 @@ jobs:
           test -f app/build.gradle.kts
           test -f app/src/main/AndroidManifest.xml
           grep -q 'compose-bom:2026.04.01' app/build.gradle.kts
-          echo "Project files found; Compose BOM is pinned to 2026.04.01 for the API 36 / AGP 8.13 toolchain."
+          echo "Project files found; Compose BOM is pinned to 2026.04.01."
 
       - name: Run unit tests
         id: unit_tests
